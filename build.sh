@@ -22,9 +22,10 @@ fi
 echo "Compiling Kopfkino…"
 swiftc -O -swift-version 5 \
   -target "$(uname -m)-apple-macos14.0" \
-  -framework CoreMotion -framework AppKit -framework Network \
+  -framework CoreMotion -framework AppKit -framework Network -framework Carbon -framework AVFoundation \
   "$DIR/macos/Kopfkino.swift" \
   -o "$APP/Contents/MacOS/Kopfkino"
 
-codesign --force --sign - "$APP" >/dev/null 2>&1
+BUNDLE_ID="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$DIR/macos/Info.plist")"
+codesign --force --sign - -r="designated => identifier \"$BUNDLE_ID\"" "$APP" >/dev/null 2>&1
 echo "Built $APP"

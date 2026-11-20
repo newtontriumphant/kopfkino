@@ -4,8 +4,6 @@ import GUI from './vendor/lil-gui.esm.min.js';
 THREE.ColorManagement.enabled = false;
 
 const D2R = Math.PI / 180;
-const AXES = ['yaw', 'pitch', 'roll'];
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function load(key, def) {
   try {
@@ -23,7 +21,6 @@ let head = { yaw: 0, pitch: 0, roll: 0 };
 let raw = [0, 0, 0];
 let hz = 0, sensor = '-', lastFrame = 0;
 let bridgeUp = false, status = null, cfg = null;
-let history = [];
 
 const mouse = { yaw: 0, pitch: 0, down: false, x: 0, y: 0 };
 let flying = true;
@@ -44,11 +41,10 @@ es.onmessage = (e) => {
   hz = f.hz;
   sensor = f.sensor;
   lastFrame = now;
-  history.push([now, f.raw]);
-  while (history.length && now - history[0][0] > 3000) history.shift();
 };
 es.addEventListener('status', (e) => { status = JSON.parse(e.data); bridgeUp = true; });
 es.addEventListener('config', (e) => onConfig(JSON.parse(e.data)));
+es.addEventListener('calib', (e) => onCalib(JSON.parse(e.data)));
 
 async function post(path, body = {}) {
   const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -764,10 +760,15 @@ function updateInfo(yaw, pitch, roll) {
   else if (isLive()) line = `<span class="ok">tracking ${hz} Hz</span> <span class="dim">${sensor}</span>`;
   else line = '<span class="warn">no airpods data</span> <span class="dim">(mouse look)</span>';
 
-  let s = `kopfkino  ${line}\n`;
+  const mode = cfg ? cfg.mode : 'pov';
+  const modeName = { off: 'OFF', pov: 'POV', cursor: 'CURSOR' }[mode];
+  let s = `kopfkino  ${line}  <span class="${mode === 'off' ? 'dim' : 'ok'}">[${modeName}]</span>\n`;
   s += `yaw ${pad(yaw).padStart(7)}  pitch ${pad(pitch).padStart(6)}  roll ${pad(roll).padStart(6)}\n`;
   if (cfg && !cfg.calibrated && isLive()) s += '<span class="warn">not calibrated, press k</span>\n';
-  s += '<span class="dim">space recenter  k calibrate  s settings  h hide</span>';
+  if (mode !== 'off' && status && status.mouseAccess === false) s += '<span class="warn">mouse control needs Accessibility (menu bar > Allow Mouse Control)</span>\n';
+  if (mode === 'cursor') s += '<span class="dim">cursor mode: sim view is parked, nod to click</span>\n';
+  if (mode === 'pov' && status) s += status.captured ? '<span class="ok">pov: game has the mouse, head look on</span>\n' : '<span class="dim">pov: games get head look when they capture the mouse</span>\n';
+  s += '<span class="dim">space recenter  k calibrate  s settings  h hide\nopt+shift+k on/off  opt+shift+m pov/cursor  opt+shift+r recenter  opt+shift+c calibrate</span>';
   info.innerHTML = s;
 }
 
@@ -780,6 +781,11 @@ const settings = {
   response,
   fov,
   opentrack: true,
+  mode: 'pov',
+  povSpeed: 7,
+  cursorReach: 15,
+  nodClick: true,
+  curve: 0.5,
   recenter,
   calibrate: () => calibrate(),
   reset: () => post('/api/config/reset').catch(() => {}),
@@ -791,10 +797,12 @@ function flip(axis) {
 }
 
 const gui = new GUI({ title: 'Kopfkino' });
+gui.add(settings, 'mode', { off: 'off', POV: 'pov', cursor: 'cursor' }).name('mode').onChange((v) => setConfig({ mode: v }));
 const tr = gui.addFolder('Tracking');
 tr.add(settings, 'yawGain', 0.5, 5, 0.1).name('yaw gain').onChange((v) => setConfig({ gainYaw: v }));
 tr.add(settings, 'pitchGain', 0.5, 5, 0.1).name('pitch gain').onChange((v) => setConfig({ gainPitch: v }));
 tr.add(settings, 'rollGain', 0, 3, 0.1).name('roll gain').onChange((v) => setConfig({ gainRoll: v }));
+tr.add(settings, 'curve', 0, 1, 0.05).name('response curve').onChange((v) => setConfig({ curve: v }));
 tr.add(settings, 'deadzone', 0, 5, 0.1).name('deadzone (deg)').onChange((v) => setConfig({ deadzoneDeg: v }));
 tr.add(settings, 'useRoll').name('use roll').onChange((v) => setConfig({ enableRoll: v }));
 tr.add({ f: () => flip('yaw') }, 'f').name('flip yaw');
@@ -811,6 +819,9 @@ vf.add(settings, 'fov', 50, 110, 1).name('fov').onChange((v) => {
 });
 
 const of = gui.addFolder('Output');
+of.add(settings, 'povSpeed', 1, 40, 0.5).name('pov mouse speed').onChange((v) => setConfig({ povMouseSpeed: v }));
+of.add(settings, 'cursorReach', 5, 45, 1).name('cursor reach (deg)').onChange((v) => setConfig({ cursorReachX: v, cursorReachY: Math.round(v * 0.6) }));
+of.add(settings, 'nodClick').name('nod to click').onChange((v) => setConfig({ nodClick: v }));
 of.add(settings, 'opentrack').name('opentrack udp :4242').onChange((v) => setConfig({ opentrackEnabled: v }));
 
 gui.add(settings, 'recenter');
@@ -826,75 +837,34 @@ function onConfig(c) {
   settings.deadzone = c.deadzoneDeg;
   settings.useRoll = c.enableRoll;
   settings.opentrack = c.opentrackEnabled;
+  settings.mode = c.mode;
+  settings.povSpeed = c.povMouseSpeed;
+  settings.cursorReach = c.cursorReachX;
+  settings.nodClick = c.nodClick;
+  settings.curve = c.curve;
   gui.controllersRecursive().forEach((ctl) => ctl.updateDisplay());
 }
 
-let calibrating = false, cancelCal = false;
+let calibTimer;
 
-async function hold(step, title, sub, ms) {
-  const t0 = performance.now();
-  while (performance.now() - t0 < ms) {
-    if (cancelCal) throw 'cancel';
-    if (!isLive()) throw new Error('lost tracking data');
-    const left = Math.ceil((ms - (performance.now() - t0)) / 1000);
-    showPrompt(`CALIBRATION ${step}/4<br>${title}<small>${sub} &nbsp; ${left}</small>`);
-    await sleep(100);
-  }
+function calibrate() {
+  post('/api/calibrate', { action: 'toggle' }).catch(() => message('calibration needs the Kopfkino app running'));
 }
 
-function average(ms) {
-  const now = performance.now();
-  const recent = history.filter(([t]) => now - t <= ms);
-  if (!recent.length) throw new Error('no samples');
-  const avg = [0, 0, 0];
-  for (const [, r] of recent) for (let i = 0; i < 3; i++) avg[i] += r[i] / recent.length;
-  return avg;
-}
-
-async function calibrate() {
-  if (calibrating) return;
-  if (!isLive()) return message('need airpods data to calibrate');
-  calibrating = true;
-  cancelCal = false;
-
-  const steps = [
-    ['yaw', 'LOOK LEFT', 'turn your head ~45° left and hold'],
-    ['pitch', 'LOOK UP', 'back to center, chin up ~30° and hold'],
-    ['roll', 'TILT LEFT', 'back to center, left ear toward shoulder and hold'],
-  ];
-
-  try {
-    await hold(1, 'LOOK STRAIGHT AHEAD', 'hold still', 2000);
-    await post('/api/recenter');
-    await sleep(400);
-
-    const map = {};
-    for (let i = 0; i < steps.length; i++) {
-      const [axis, title, sub] = steps[i];
-      await hold(i + 2, title, sub, 3000);
-      const avg = average(600);
-      let best = 0;
-      for (let j = 1; j < 3; j++) if (Math.abs(avg[j]) > Math.abs(avg[best])) best = j;
-      if (Math.abs(avg[best]) < 8) throw new Error(`only moved ${Math.abs(avg[best]).toFixed(0)}° on "${title.toLowerCase()}", go further`);
-      map[axis] = { source: AXES[best], sign: Math.sign(avg[best]) };
-    }
-    if (new Set(Object.values(map).map((m) => m.source)).size < 3) {
-      throw new Error('two moves hit the same sensor axis, try cleaner moves');
-    }
-
-    await post('/api/config', { ...map, calibrated: true });
-    showPrompt('CALIBRATED<small>look back at the screen</small>');
-    await sleep(1500);
-    recenter();
+function onCalib(c) {
+  clearTimeout(calibTimer);
+  if (c.state === 'running') {
+    const left = Math.max(0, Math.ceil(c.remaining));
+    showPrompt(`CALIBRATION ${c.step}/${c.total}<br>${c.title.toUpperCase()}<small>${c.sub} &nbsp; ${left}</small>`);
+  } else if (c.state === 'done') {
+    showPrompt('CALIBRATED<small>saved for good. run it again any time with k or opt+shift+c</small>');
+    calibTimer = setTimeout(() => showPrompt(''), 3500);
+  } else if (c.state === 'failed') {
+    showPrompt(`CALIBRATION FAILED<small>${c.message}. press k to try again</small>`);
+    calibTimer = setTimeout(() => showPrompt(''), 6000);
+  } else {
     showPrompt('');
-  } catch (e) {
-    if (e === 'cancel') showPrompt('');
-    else {
-      showPrompt(`CALIBRATION FAILED<small>${e.message}. press k to retry</small>`);
-      setTimeout(() => !calibrating && showPrompt(''), 5000);
-    }
   }
-  calibrating = false;
 }
 
 let guiOpen = false;
@@ -921,7 +891,7 @@ addEventListener('keydown', (e) => {
     flying = !flying;
     message(flying ? 'resumed' : 'paused', 1200);
   } else if (k === 'escape') {
-    cancelCal = true;
+    post('/api/calibrate', { action: 'cancel' }).catch(() => {});
   }
 });
 
@@ -960,9 +930,10 @@ function tick() {
   if (flying) travelled += SPEED * dt;
 
   const live = isLive();
-  const yaw = live ? head.yaw : -mouse.yaw;
-  const pitch = live ? head.pitch : -mouse.pitch;
-  const roll = live ? head.roll : 0;
+  const follow = live && (!cfg || cfg.mode === 'pov');
+  const yaw = follow ? head.yaw : live ? 0 : -mouse.yaw;
+  const pitch = follow ? head.pitch : live ? 0 : -mouse.pitch;
+  const roll = follow ? head.roll : 0;
 
   target.setFromEuler(euler.set(pitch * D2R, yaw * D2R, roll * D2R));
   neck.quaternion.slerp(target, 1 - Math.exp(-response * dt));
