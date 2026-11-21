@@ -14,7 +14,7 @@ It also sends OpenTrack UDP packets on port `4242`, so eventually you can use it
 
 ## Requirements
 
-- **A Mac on macOS 14 (Sonoma) or newer**
+- **A Mac on macOS 14 (Sonoma) or newer** (14.2+ for Spatial Audio²)
 - **AirPods Pro (any model), AirPods Max (any model), or AirPods 3rd gen or newer**
 
 That's it! The installer handles everything else.
@@ -48,6 +48,18 @@ kopfkino lives in your **menu bar** (the little spinny gyroscope icon up top). F
 - **Cursor Mode**: your cursor goes wherever you look on screen, gets a bit bigger so you can actually see it, and gently snaps onto buttons and links. **Nod to click!** You can still use your real mouse whenever, and head tracking takes back over a quarter second after you stop.
 
 The first time you turn on POV or Cursor mode, macOS asks if kopfkino can control your mouse. Click **Open System Settings** and flip the switch next to Kopfkino! (If you missed it, click **Allow Mouse Control…** in the menu bar.)
+
+### Spatial Audio²
+
+macOS only gives you head-tracked Spatial Audio in Apple's own apps (Safari, Music, TV, QuickTime). Chrome, Arc, Spotify, Discord, games... nope. Flat stereo.
+
+Click **Spatial Audio²** in the menu bar and EVERY app gets it! kopfkino grabs each app's sound digitally (no virtual audio device, no driver, so your AirPods stay in full quality) and hands it to macOS's own Spatialize Stereo, the exact same thing Safari uses. That means you control it right from Control Center (Sound → your AirPods → Spatialize Stereo: Off / Fixed / Head Tracked), just like an Apple app! Apple's own apps are left alone so they keep their native Dolby Atmos.
+
+macOS's spatial audio likes to buffer a LOT (like a third of a second), so when it starts kopfkino plays the audio a tiny bit faster for a few seconds until it catches up to ~150 ms, then keeps it locked there. You might hear things sound slightly sped up for a moment after turning it on or switching modes, that's just it catching up :3
+
+The first time, macOS asks if kopfkino can record system audio. That's how it grabs the sound, click **Allow**. Audio never leaves your Mac.
+
+If sound ever cuts out completely, kopfkino notices and fixes itself, and if it really can't, it turns Spatial Audio² off on its own so your audio comes straight back.
 
 These shortcuts work everywhere, even mid-game:
 

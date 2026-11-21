@@ -786,6 +786,7 @@ const settings = {
   cursorReach: 15,
   nodClick: true,
   curve: 0.5,
+  spatialAudio: false,
   recenter,
   calibrate: () => calibrate(),
   reset: () => post('/api/config/reset').catch(() => {}),
@@ -821,6 +822,7 @@ vf.add(settings, 'fov', 50, 110, 1).name('fov').onChange((v) => {
 const of = gui.addFolder('Output');
 of.add(settings, 'povSpeed', 1, 40, 0.5).name('pov mouse speed').onChange((v) => setConfig({ povMouseSpeed: v }));
 of.add(settings, 'cursorReach', 5, 45, 1).name('cursor reach (deg)').onChange((v) => setConfig({ cursorReachX: v, cursorReachY: Math.round(v * 0.6) }));
+of.add(settings, 'spatialAudio').name('spatial audio² (all apps)').onChange((v) => setConfig({ spatialAudio: v }));
 of.add(settings, 'nodClick').name('nod to click').onChange((v) => setConfig({ nodClick: v }));
 of.add(settings, 'opentrack').name('opentrack udp :4242').onChange((v) => setConfig({ opentrackEnabled: v }));
 
@@ -842,6 +844,7 @@ function onConfig(c) {
   settings.cursorReach = c.cursorReachX;
   settings.nodClick = c.nodClick;
   settings.curve = c.curve;
+  settings.spatialAudio = c.spatialAudio;
   gui.controllersRecursive().forEach((ctl) => ctl.updateDisplay());
 }
 

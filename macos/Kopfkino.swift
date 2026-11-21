@@ -1,6 +1,10 @@
 import AppKit
+import AudioToolbox
 import AVFoundation
+import CoreMedia
+import os
 import Carbon
+import CoreAudio
 import CoreMotion
 import Foundation
 import Network
@@ -133,6 +137,7 @@ struct Config: Codable {
     var nodClick = true
     var curve: Double = 0.5
     var calibration: CalibrationData?
+    var spatialAudio = false
 
     static let axes = ["yaw", "pitch", "roll"]
     static let modes = ["off", "pov", "cursor"]
@@ -680,6 +685,652 @@ func requestAccessibility() {
     _ = AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
 }
 
+enum AudioCapturePermission {
+    private static let lib = dlopen("/System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC", RTLD_NOW)
+    private typealias Preflight = @convention(c) (CFString, CFDictionary?) -> Int
+    private typealias Request = @convention(c) (CFString, CFDictionary?, @escaping @convention(block) (Bool) -> Void) -> Void
+    private static let service = "kTCCServiceAudioCapture" as CFString
+
+    static var granted: Bool {
+        guard let p = dlsym(lib, "TCCAccessPreflight") else { return true }
+        return unsafeBitCast(p, to: Preflight.self)(service, nil) == 0
+    }
+
+    static func request(_ done: @escaping (Bool) -> Void) {
+        guard let p = dlsym(lib, "TCCAccessRequest") else { return done(true) }
+        unsafeBitCast(p, to: Request.self)(service, nil) { ok in done(ok) }
+    }
+}
+
+enum HAL {
+    static let system = AudioObjectID(kAudioObjectSystemObject)
+
+    static func addr(_ sel: AudioObjectPropertySelector, _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: sel, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+    }
+
+    static func get<T>(_ obj: AudioObjectID, _ sel: AudioObjectPropertySelector, _ def: T,
+                       scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> T {
+        var a = addr(sel, scope)
+        var v = def
+        var size = UInt32(MemoryLayout<T>.size)
+        let st = withUnsafeMutableBytes(of: &v) { AudioObjectGetPropertyData(obj, &a, 0, nil, &size, $0.baseAddress!) }
+        return st == noErr ? v : def
+    }
+
+    static func string(_ obj: AudioObjectID, _ sel: AudioObjectPropertySelector) -> String? {
+        var a = addr(sel)
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        var v: Unmanaged<CFString>?
+        guard AudioObjectGetPropertyData(obj, &a, 0, nil, &size, &v) == noErr, let s = v?.takeRetainedValue() else { return nil }
+        return s as String
+    }
+
+    static func list(_ obj: AudioObjectID, _ sel: AudioObjectPropertySelector,
+                     scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> [AudioObjectID] {
+        var a = addr(sel, scope)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(obj, &a, 0, nil, &size) == noErr, size > 0 else { return [] }
+        var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(obj, &a, 0, nil, &size, &ids) == noErr else { return [] }
+        return ids
+    }
+
+    static func processObject(pid: pid_t) -> AudioObjectID {
+        var a = addr(kAudioHardwarePropertyTranslatePIDToProcessObject)
+        var p = pid
+        var obj = AudioObjectID(0)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        _ = AudioObjectGetPropertyData(system, &a, UInt32(MemoryLayout<pid_t>.size), &p, &size, &obj)
+        return obj
+    }
+}
+
+final class SampleRing {
+    let capacity: Int
+    private let data: UnsafeMutablePointer<Float>
+    private let lock: UnsafeMutablePointer<os_unfair_lock>
+    private var writeIndex = 0
+    private var readIndex = 0
+    var peak: Float = 0
+    var watchPeak: Float = 0
+
+    init(frames: Int) {
+        capacity = frames
+        data = .allocate(capacity: frames * 2)
+        data.initialize(repeating: 0, count: frames * 2)
+        lock = .allocate(capacity: 1)
+        lock.initialize(to: os_unfair_lock())
+    }
+
+    var available: Int {
+        os_unfair_lock_lock(lock)
+        defer { os_unfair_lock_unlock(lock) }
+        return writeIndex - readIndex
+    }
+
+    func drop(_ frames: Int) -> Int {
+        os_unfair_lock_lock(lock)
+        let n = min(frames, writeIndex - readIndex)
+        readIndex += n
+        os_unfair_lock_unlock(lock)
+        return n
+    }
+
+    func clear(keeping keep: Int = 0) {
+        os_unfair_lock_lock(lock)
+        readIndex = max(readIndex, writeIndex - keep)
+        os_unfair_lock_unlock(lock)
+    }
+
+    func write(_ list: UnsafePointer<AudioBufferList>) {
+        let ins = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: list))
+        guard ins.count > 0 else { return }
+        var top: Float = 0
+        os_unfair_lock_lock(lock)
+        if ins.count == 1, let src = ins[0].mData?.assumingMemoryBound(to: Float.self) {
+            let ch = max(1, Int(ins[0].mNumberChannels))
+            let frames = Int(ins[0].mDataByteSize) / (4 * ch)
+            for i in 0..<frames {
+                let a = src[i * ch], b = ch > 1 ? src[i * ch + 1] : a
+                let pos = (writeIndex + i) % capacity
+                data[pos * 2] = a
+                data[pos * 2 + 1] = b
+                top = max(top, abs(a), abs(b))
+            }
+            writeIndex += frames
+        } else if ins.count >= 2, let a = ins[0].mData?.assumingMemoryBound(to: Float.self),
+                  let b = ins[1].mData?.assumingMemoryBound(to: Float.self) {
+            let frames = min(Int(ins[0].mDataByteSize), Int(ins[1].mDataByteSize)) / 4
+            for i in 0..<frames {
+                let pos = (writeIndex + i) % capacity
+                data[pos * 2] = a[i]
+                data[pos * 2 + 1] = b[i]
+                top = max(top, abs(a[i]), abs(b[i]))
+            }
+            writeIndex += frames
+        }
+        if writeIndex - readIndex > capacity { readIndex = writeIndex - capacity }
+        if top > peak { peak = top }
+        if top > watchPeak { watchPeak = top }
+        os_unfair_lock_unlock(lock)
+    }
+
+    func read(into dst: UnsafeMutablePointer<Float>, frames: Int) -> Int {
+        os_unfair_lock_lock(lock)
+        let n = min(frames, writeIndex - readIndex)
+        for i in 0..<n {
+            let pos = (readIndex + i) % capacity
+            dst[i * 2] = data[pos * 2]
+            dst[i * 2 + 1] = data[pos * 2 + 1]
+        }
+        readIndex += n
+        os_unfair_lock_unlock(lock)
+        return n
+    }
+}
+
+final class SpatialAudio {
+    static let nativeSpatial: Set<String> = [
+        "com.apple.Safari", "com.apple.WebKit.GPU", "com.apple.WebKit.WebContent", "com.apple.Music",
+        "com.apple.TV", "com.apple.QuickTimePlayerX", "com.apple.podcasts", "com.apple.FaceTime", "com.apple.avconferenced",
+    ]
+
+    let q = DispatchQueue(label: "kopfkino.spatial")
+    private let feedQ = DispatchQueue(label: "kopfkino.spatial.feed", qos: .userInteractive)
+    private let ring = SampleRing(frames: 48000)
+    private let meterRing = SampleRing(frames: 4800)
+    private var tapID = AudioObjectID(0)
+    private var aggID = AudioObjectID(0)
+    private var outID = AudioObjectID(0)
+    private var procID: AudioDeviceIOProcID?
+    private var meterTap = AudioObjectID(0)
+    private var meterAgg = AudioObjectID(0)
+    private var meterProc: AudioDeviceIOProcID?
+    private var excluded: Set<AudioObjectID> = []
+    private var listening = false
+    private var restartWork: DispatchWorkItem?
+    private var announcedAudio = false
+    private var renderer: AVSampleBufferAudioRenderer?
+    private var sync: AVSampleBufferRenderSynchronizer?
+    private var format: CMAudioFormatDescription?
+    private var feedTimer: DispatchSourceTimer?
+    private var flushObserver: NSObjectProtocol?
+    private var rate = 48000.0
+    private var queued: Int64 = 0
+    private var playing = false
+    private var playStart = 0.0
+    private var lastResync = 0.0
+    private var watchStart = 0.0
+    private var activeSince = 0.0
+    private var silentWindows = 0
+    private var rescues: [Double] = []
+    private var naturalLead = 0.0
+    private var targetLead = 0.15
+    private var smoothLead = 0.0
+    private var lastFeed = 0.0
+    private var speed = 0.0
+    private var frameDebt = 0.0
+    private var caughtUp = false
+    private let scratch = UnsafeMutablePointer<Float>.allocate(capacity: 4096)
+    private(set) var running = false
+    private(set) var lead = 0.0
+    var wanted = false
+    var onState: ((String) -> Void)?
+    var onGiveUp: (() -> Void)?
+
+    var level: Float {
+        let v = ring.peak
+        ring.peak = 0
+        return v
+    }
+
+    var outputLevel: Float {
+        let v = meterRing.peak
+        meterRing.peak = 0
+        return v
+    }
+
+    func enable() {
+        wanted = true
+        installListeners()
+        start()
+    }
+
+    func disable() {
+        wanted = false
+        stop()
+        onState?("off")
+    }
+
+    private func exclusions() -> [AudioObjectID] {
+        var ids: [AudioObjectID] = []
+        let own = HAL.processObject(pid: getpid())
+        if own != 0 { ids.append(own) }
+        for p in HAL.list(HAL.system, kAudioHardwarePropertyProcessObjectList) where p != own {
+            if let b = HAL.string(p, kAudioProcessPropertyBundleID), SpatialAudio.nativeSpatial.contains(b) { ids.append(p) }
+        }
+        return ids
+    }
+
+    private func makeAggregate(name: String, outUID: String, tapUID: String) -> AudioObjectID {
+        let desc: [String: Any] = [
+            kAudioAggregateDeviceNameKey: name,
+            kAudioAggregateDeviceUIDKey: "kopfkino-\(UUID().uuidString)",
+            kAudioAggregateDeviceMainSubDeviceKey: outUID,
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceIsStackedKey: false,
+            kAudioAggregateDeviceTapAutoStartKey: true,
+            kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: outUID]],
+            kAudioAggregateDeviceTapListKey: [[kAudioSubTapDriftCompensationKey: true, kAudioSubTapUIDKey: tapUID]],
+        ]
+        var agg = AudioObjectID(0)
+        guard AudioHardwareCreateAggregateDevice(desc as CFDictionary, &agg) == noErr else { return 0 }
+        var range = AudioValueRange()
+        var rangeAddr = HAL.addr(kAudioDevicePropertyBufferFrameSizeRange)
+        var rangeSize = UInt32(MemoryLayout<AudioValueRange>.size)
+        AudioObjectGetPropertyData(agg, &rangeAddr, 0, nil, &rangeSize, &range)
+        var frames = UInt32(max(range.mMinimum, 256))
+        var bufAddr = HAL.addr(kAudioDevicePropertyBufferFrameSize)
+        AudioObjectSetPropertyData(agg, &bufAddr, 0, nil, UInt32(MemoryLayout<UInt32>.size), &frames)
+        return agg
+    }
+
+    private func start() {
+        stop()
+        guard wanted else { return }
+        guard #available(macOS 14.2, *) else {
+            onState?("needs macOS 14.2")
+            return
+        }
+        let out: AudioObjectID = HAL.get(HAL.system, kAudioHardwarePropertyDefaultOutputDevice, AudioObjectID(0))
+        guard out != 0, let outUID = HAL.string(out, kAudioDevicePropertyDeviceUID) else {
+            onState?("no output device")
+            return
+        }
+        let outName = HAL.string(out, kAudioObjectPropertyName) ?? "output"
+        outID = out
+
+        let excl = exclusions()
+        let desc = CATapDescription(stereoGlobalTapButExcludeProcesses: excl)
+        desc.name = "Kopfkino Spatial Audio"
+        desc.isPrivate = true
+        desc.muteBehavior = .mutedWhenTapped
+        var tap = AudioObjectID(0)
+        let tapStatus = AudioHardwareCreateProcessTap(desc, &tap)
+        guard tapStatus == noErr, tap != 0 else {
+            log("Spatial audio: tap failed (\(tapStatus))")
+            onState?("could not capture audio")
+            return
+        }
+        tapID = tap
+        let agg = makeAggregate(name: "Kopfkino Spatial", outUID: outUID, tapUID: desc.uuid.uuidString)
+        guard agg != 0 else {
+            stop()
+            onState?("could not open output")
+            return
+        }
+        aggID = agg
+        rate = HAL.get(agg, kAudioDevicePropertyNominalSampleRate, 0.0)
+        let bufFrames: UInt32 = HAL.get(agg, kAudioDevicePropertyBufferFrameSize, 0)
+        log("Spatial audio: \(outName) @ \(Int(rate)) Hz, \(bufFrames)-frame capture, native/excluded: \(excl.compactMap { HAL.string($0, kAudioProcessPropertyBundleID) }.joined(separator: ", "))")
+        guard rate > 0 else {
+            stop()
+            onState?("bad sample rate")
+            return
+        }
+
+        var asbd = AudioStreamBasicDescription(mSampleRate: rate, mFormatID: kAudioFormatLinearPCM,
+                                               mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+                                               mBytesPerPacket: 8, mFramesPerPacket: 1, mBytesPerFrame: 8,
+                                               mChannelsPerFrame: 2, mBitsPerChannel: 32, mReserved: 0)
+        var layout = AudioChannelLayout()
+        layout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo
+        var fd: CMAudioFormatDescription?
+        CMAudioFormatDescriptionCreate(allocator: kCFAllocatorDefault, asbd: &asbd, layoutSize: MemoryLayout<AudioChannelLayout>.size,
+                                       layout: &layout, magicCookieSize: 0, magicCookie: nil, extensions: nil, formatDescriptionOut: &fd)
+        guard let fd else {
+            stop()
+            onState?("could not set up playback")
+            return
+        }
+        format = fd
+
+        let r = AVSampleBufferAudioRenderer()
+        r.allowedAudioSpatializationFormats = .monoAndStereo
+        r.audioTimePitchAlgorithm = .varispeed
+        r.audioOutputDeviceUniqueID = outUID
+        r.volume = 0.7
+        let sy = AVSampleBufferRenderSynchronizer()
+        sy.delaysRateChangeUntilHasSufficientMediaData = false
+        sy.addRenderer(r)
+        renderer = r
+        sync = sy
+        flushObserver = NotificationCenter.default.addObserver(forName: .AVSampleBufferAudioRendererWasFlushedAutomatically,
+                                                               object: r, queue: nil) { [weak self] _ in
+            self?.feedQ.async { self?.resync("macOS changed the spatial mode") }
+        }
+
+        ring.clear()
+        let ringRef = ring
+        var proc: AudioDeviceIOProcID?
+        let ioStatus = AudioDeviceCreateIOProcIDWithBlock(&proc, agg, nil) { _, inInput, _, outOutput, _ in
+            ringRef.write(inInput)
+            for buf in UnsafeMutableAudioBufferListPointer(outOutput) {
+                if let d = buf.mData { memset(d, 0, Int(buf.mDataByteSize)) }
+            }
+        }
+        guard ioStatus == noErr, let proc else {
+            log("Spatial audio: IOProc failed (\(ioStatus))")
+            stop()
+            onState?("could not start")
+            return
+        }
+        procID = proc
+
+        feedQ.sync {
+            queued = 0
+            playing = false
+            let t = DispatchSource.makeTimerSource(flags: .strict, queue: feedQ)
+            t.schedule(deadline: .now(), repeating: .milliseconds(4), leeway: .milliseconds(1))
+            t.setEventHandler { [weak self] in self?.feed() }
+            t.resume()
+            feedTimer = t
+        }
+
+        let startStatus = AudioDeviceStart(agg, proc)
+        guard startStatus == noErr else {
+            log("Spatial audio: start failed (\(startStatus))")
+            stop()
+            onState?("could not start")
+            return
+        }
+        excluded = Set(excl)
+        running = true
+        announcedAudio = false
+        startMeter(outUID: outUID)
+        log("Spatial audio: on, playing through macOS Spatialize Stereo")
+        onState?("on")
+    }
+
+    private func startMeter(outUID: String) {
+        guard #available(macOS 14.2, *) else { return }
+        let own = HAL.processObject(pid: getpid())
+        guard own != 0 else { return }
+        let d = CATapDescription(stereoMixdownOfProcesses: [own])
+        d.isPrivate = true
+        d.muteBehavior = .unmuted
+        var tap = AudioObjectID(0)
+        guard AudioHardwareCreateProcessTap(d, &tap) == noErr, tap != 0 else { return }
+        meterTap = tap
+        let agg = makeAggregate(name: "Kopfkino Meter", outUID: outUID, tapUID: d.uuid.uuidString)
+        guard agg != 0 else { return }
+        meterAgg = agg
+        let mr = meterRing
+        var proc: AudioDeviceIOProcID?
+        AudioDeviceCreateIOProcIDWithBlock(&proc, agg, nil) { _, inInput, _, outOutput, _ in
+            mr.write(inInput)
+            mr.clear()
+            for buf in UnsafeMutableAudioBufferListPointer(outOutput) {
+                if let p = buf.mData { memset(p, 0, Int(buf.mDataByteSize)) }
+            }
+        }
+        if let proc {
+            meterProc = proc
+            AudioDeviceStart(agg, proc)
+        }
+    }
+
+    private func stopMeter() {
+        if meterAgg != 0, let p = meterProc {
+            AudioDeviceStop(meterAgg, p)
+            AudioDeviceDestroyIOProcID(meterAgg, p)
+        }
+        meterProc = nil
+        if meterAgg != 0 { AudioHardwareDestroyAggregateDevice(meterAgg) }
+        meterAgg = 0
+        if meterTap != 0, #available(macOS 14.2, *) { AudioHardwareDestroyProcessTap(meterTap) }
+        meterTap = 0
+    }
+
+    private func feed() {
+        guard let renderer, let sync, let format else { return }
+        if renderer.status == .failed {
+            log("Spatial audio: renderer failed (\(renderer.error?.localizedDescription ?? "?"))")
+            resync("renderer failed")
+            return
+        }
+        let ts = CMTimeScale(rate)
+        let now = ProcessInfo.processInfo.systemUptime
+        if !playing {
+            guard ring.available >= Int(rate * 0.01) else { return }
+            let startFrame = queued
+            enqueueAvailable(renderer, format, ts)
+            sync.setRate(1, time: CMTime(value: startFrame, timescale: ts))
+            playing = true
+            playStart = now
+            lastFeed = now
+            watchStart = now
+            activeSince = 0
+            silentWindows = 0
+            naturalLead = 0
+            smoothLead = 0
+            speed = 0
+            frameDebt = 0
+            caughtUp = false
+            targetLead = 0.15
+            ring.watchPeak = 0
+            meterRing.watchPeak = 0
+            return
+        }
+        enqueueAvailable(renderer, format, ts)
+        lead = Double(queued) / rate - CMTimeGetSeconds(sync.currentTime())
+        if (lead < 0.005 || lead > 2.5) && now - lastResync > 2 {
+            resync(String(format: "lead %.0f ms", lead * 1000))
+            return
+        }
+        let dt = min(0.05, max(0.001, now - lastFeed))
+        lastFeed = now
+        smoothLead = smoothLead == 0 ? lead : smoothLead + (lead - smoothLead) * min(1, dt / 0.3)
+        guard now - playStart > 0.5 else { return }
+        if naturalLead == 0 {
+            naturalLead = smoothLead
+            log(String(format: "Spatial audio: macOS buffered %.0f ms, catching up to %.0f ms", naturalLead * 1000, targetLead * 1000))
+        }
+        let error = smoothLead - targetLead
+        speed = min(0.05, max(-0.02, error * 0.25))
+        if !caughtUp && abs(error) < 0.01 {
+            caughtUp = true
+            log(String(format: "Spatial audio: caught up, delay %.0f ms", smoothLead * 1000))
+        }
+
+        guard now - watchStart >= 1.0 else { return }
+        let input = ring.watchPeak, output = meterRing.watchPeak
+        ring.watchPeak = 0
+        meterRing.watchPeak = 0
+        watchStart = now
+        guard meterAgg != 0 else { return }
+        if input < 0.02 {
+            activeSince = 0
+            silentWindows = 0
+            return
+        }
+        if activeSince == 0 { activeSince = now }
+        guard now - activeSince > smoothLead + 1.0 else { return }
+        if output < 0.003 {
+            silentWindows += 1
+        } else {
+            silentWindows = 0
+        }
+        guard silentWindows >= 2 else { return }
+        silentWindows = 0
+        activeSince = now
+        let before = targetLead
+        if targetLead < naturalLead - 0.005 {
+            targetLead = min(naturalLead, targetLead + 0.12)
+            pad(max(0, targetLead - smoothLead))
+            log(String(format: "Spatial audio: silent at %.0f ms, raising delay to %.0f ms", before * 1000, targetLead * 1000))
+            return
+        }
+        rescues = rescues.filter { now - $0 < 20 } + [now]
+        if rescues.count >= 3 {
+            log("Spatial audio: output keeps going silent, turning Spatial Audio² off")
+            rescues.removeAll()
+            q.async { [weak self] in self?.onGiveUp?() }
+            return
+        }
+        resync("apps are playing but output is silent")
+    }
+
+    private func pad(_ seconds: Double) {
+        guard let renderer, let format else { return }
+        let n = Int(seconds * rate)
+        var block: CMBlockBuffer?
+        guard CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: n * 8,
+                                                 blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0,
+                                                 dataLength: n * 8, flags: kCMBlockBufferAssureMemoryNowFlag,
+                                                 blockBufferOut: &block) == noErr, let block else { return }
+        CMBlockBufferFillDataBytes(with: 0, blockBuffer: block, offsetIntoDestination: 0, dataLength: n * 8)
+        var sb: CMSampleBuffer?
+        CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: format,
+                                                              sampleCount: n, presentationTimeStamp: CMTime(value: queued, timescale: CMTimeScale(rate)),
+                                                              packetDescriptions: nil, sampleBufferOut: &sb)
+        guard let sb else { return }
+        renderer.enqueue(sb)
+        queued += Int64(n)
+    }
+
+    private func enqueueAvailable(_ renderer: AVSampleBufferAudioRenderer, _ format: CMAudioFormatDescription, _ ts: CMTimeScale) {
+        while true {
+            let n = min(ring.available, 1024)
+            if n < 256 { return }
+            let got = ring.read(into: scratch, frames: n)
+            frameDebt += Double(got) * speed
+            var delta = Int(frameDebt.rounded(.towardZero))
+            delta = min(delta, got / 10)
+            delta = max(delta, -got / 20)
+            frameDebt -= Double(delta)
+            let outFrames = got - delta
+            var block: CMBlockBuffer?
+            guard CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: outFrames * 8,
+                                                     blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0,
+                                                     dataLength: outFrames * 8, flags: kCMBlockBufferAssureMemoryNowFlag,
+                                                     blockBufferOut: &block) == noErr, let block else { return }
+            var ptr: UnsafeMutablePointer<CChar>?
+            CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: nil, dataPointerOut: &ptr)
+            guard let ptr else { return }
+            let dst = UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: Float.self)
+            if outFrames == got {
+                dst.update(from: scratch, count: got * 2)
+            } else {
+                stretch(scratch, got, into: dst, outFrames)
+            }
+            var sb: CMSampleBuffer?
+            CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: kCFAllocatorDefault, dataBuffer: block,
+                                                                  formatDescription: format, sampleCount: outFrames,
+                                                                  presentationTimeStamp: CMTime(value: queued, timescale: ts),
+                                                                  packetDescriptions: nil, sampleBufferOut: &sb)
+            guard let sb else { return }
+            renderer.enqueue(sb)
+            queued += Int64(outFrames)
+        }
+    }
+
+    private func stretch(_ src: UnsafeMutablePointer<Float>, _ n: Int, into dst: UnsafeMutablePointer<Float>, _ m: Int) {
+        let step = Double(n - 1) / Double(m - 1)
+        for j in 0..<m {
+            let pos = Double(j) * step
+            let i = min(n - 1, Int(pos))
+            let t = Float(pos - Double(i))
+            for c in 0..<2 {
+                let p0 = src[max(0, i - 1) * 2 + c], p1 = src[i * 2 + c]
+                let p2 = src[min(n - 1, i + 1) * 2 + c], p3 = src[min(n - 1, i + 2) * 2 + c]
+                let a = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3
+                let b = p0 - 2.5 * p1 + 2 * p2 - 0.5 * p3
+                let cc = -0.5 * p0 + 0.5 * p2
+                dst[j * 2 + c] = ((a * t + b) * t + cc) * t + p1
+            }
+        }
+    }
+
+    private func resync(_ why: String) {
+        guard let renderer, let sync else { return }
+        sync.setRate(0, time: CMTime(value: queued, timescale: CMTimeScale(rate)))
+        renderer.flush()
+        ring.clear(keeping: Int(rate * 0.01))
+        playing = false
+        lastResync = ProcessInfo.processInfo.systemUptime
+        log("Spatial audio: resync (\(why))")
+    }
+
+    func stop() {
+        stopMeter()
+        if aggID != 0, let proc = procID {
+            AudioDeviceStop(aggID, proc)
+            AudioDeviceDestroyIOProcID(aggID, proc)
+        }
+        procID = nil
+        feedQ.sync {
+            feedTimer?.cancel()
+            feedTimer = nil
+            if let sync { sync.setRate(0, time: .zero) }
+            renderer?.flush()
+            if let r = renderer, let sync { sync.removeRenderer(r, at: .zero) }
+            renderer = nil
+            sync = nil
+            format = nil
+            playing = false
+        }
+        if let o = flushObserver { NotificationCenter.default.removeObserver(o) }
+        flushObserver = nil
+        if aggID != 0 { AudioHardwareDestroyAggregateDevice(aggID) }
+        aggID = 0
+        if tapID != 0, #available(macOS 14.2, *) { AudioHardwareDestroyProcessTap(tapID) }
+        tapID = 0
+        if running { log("Spatial audio: off") }
+        running = false
+    }
+
+    func checkAudioFlowing(_ input: Float) {
+        if running && !announcedAudio && input > 0.0005 {
+            announcedAudio = true
+            log("Spatial audio: capturing app audio ✔")
+        }
+    }
+
+    private func scheduleRestart(_ reason: String) {
+        guard wanted else { return }
+        restartWork?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            guard let self, self.wanted else { return }
+            log("Spatial audio: restarting (\(reason))")
+            self.start()
+        }
+        restartWork = w
+        q.asyncAfter(deadline: .now() + 0.4, execute: w)
+    }
+
+    private func installListeners() {
+        guard !listening else { return }
+        listening = true
+        var outAddr = HAL.addr(kAudioHardwarePropertyDefaultOutputDevice)
+        AudioObjectAddPropertyListenerBlock(HAL.system, &outAddr, q) { [weak self] _, _ in
+            self?.scheduleRestart("output device changed")
+        }
+        var procAddr = HAL.addr(kAudioHardwarePropertyProcessObjectList)
+        AudioObjectAddPropertyListenerBlock(HAL.system, &procAddr, q) { [weak self] _, _ in
+            guard let self, self.running else { return }
+            if Set(self.exclusions()) != self.excluded { self.scheduleRestart("native spatial app changed") }
+        }
+        var devAddr = HAL.addr(kAudioHardwarePropertyDevices)
+        AudioObjectAddPropertyListenerBlock(HAL.system, &devAddr, q) { [weak self] _, _ in
+            guard let self, self.running else { return }
+            let rate: Double = HAL.get(self.outID, kAudioDevicePropertyNominalSampleRate, 0.0)
+            if rate == 0 { self.scheduleRestart("output device went away") }
+        }
+    }
+}
+
 final class Engine: NSObject, CMHeadphoneMotionManagerDelegate {
     let opts: Options
     var config: Config
@@ -715,6 +1366,11 @@ final class Engine: NSObject, CMHeadphoneMotionManagerDelegate {
     var calibStepStart = 0.0
     var calibResults: [String: [Double]] = [:]
     var onCalib: ((CalibUI) -> Void)?
+    let spatial = SpatialAudio()
+    var spatialState = "off"
+    var spatialLevels: (input: Float, output: Float) = (0, 0)
+    var spatialOutLevel: Float = 0
+    var onSpatial: ((Bool, String) -> Void)?
 
     init(opts: Options) {
         self.opts = opts
@@ -746,6 +1402,15 @@ final class Engine: NSObject, CMHeadphoneMotionManagerDelegate {
                 config.save(to: opts.configURL)
             }
             modeDidChange(prompt: firstLaunch)
+            spatial.onState = { [weak self] st in serverQ.async { self?.spatialStateChanged(st) } }
+            spatial.onGiveUp = { [weak self] in
+                serverQ.async {
+                    guard let self else { return }
+                    try? self.apply(patch: ["spatialAudio": false])
+                    self.spatialStateChanged("turned off: no sound came through")
+                }
+            }
+            if config.spatialAudio { spatialDidChange() }
         }
         DispatchQueue.main.async { self.startMotion() }
     }
@@ -878,6 +1543,16 @@ final class Engine: NSObject, CMHeadphoneMotionManagerDelegate {
             notifyMode()
         }
         if allowed && !pointer.watch.active { DispatchQueue.main.async { self.pointer.watch.start() } }
+        spatial.q.async { [spatial] in
+            let lv = spatial.level
+            spatial.checkAudioFlowing(lv)
+            let lead = spatial.lead
+            let outLv = spatial.outputLevel
+            serverQ.async {
+                self.spatialLevels = (lv, Float(lead))
+                self.spatialOutLevel = outLv
+            }
+        }
         server.broadcastStatus()
 
         let text: String
@@ -1023,6 +1698,44 @@ final class Engine: NSObject, CMHeadphoneMotionManagerDelegate {
         publish(ui)
     }
 
+    func spatialStateChanged(_ st: String) {
+        spatialState = st
+        server.broadcastStatus()
+        let on = config.spatialAudio
+        if let cb = onSpatial { DispatchQueue.main.async { cb(on, st) } }
+    }
+
+    func spatialDidChange() {
+        guard config.spatialAudio else {
+            spatial.q.async { [spatial] in spatial.disable() }
+            return
+        }
+        if AudioCapturePermission.granted {
+            spatial.q.async { [spatial] in spatial.enable() }
+            return
+        }
+        spatialStateChanged("waiting for permission")
+        AudioCapturePermission.request { [weak self] ok in
+            serverQ.async {
+                guard let self else { return }
+                if ok && self.config.spatialAudio {
+                    self.spatial.q.async { [spatial = self.spatial] in spatial.enable() }
+                } else if !ok {
+                    log("Spatial audio: System Audio Recording permission denied")
+                    try? self.apply(patch: ["spatialAudio": false])
+                    self.spatialStateChanged("needs System Audio Recording permission")
+                    DispatchQueue.main.async {
+                        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture")!)
+                    }
+                }
+            }
+        }
+    }
+
+    func toggleSpatial() {
+        try? apply(patch: ["spatialAudio": !config.spatialAudio])
+    }
+
     func setMode(_ mode: String) {
         try? apply(patch: ["mode": mode])
     }
@@ -1076,6 +1789,7 @@ final class Engine: NSObject, CMHeadphoneMotionManagerDelegate {
     func shutdown() {
         motion.stopDeviceMotionUpdates()
         restoreCursor()
+        spatial.q.sync { spatial.stop() }
     }
 
     func statusJSON() -> String {
@@ -1093,6 +1807,10 @@ final class Engine: NSObject, CMHeadphoneMotionManagerDelegate {
             "mode": config.mode,
             "mouseAccess": pointer.allowed,
             "captured": povCaptured,
+            "spatial": spatialState,
+            "spatialIn": Double(spatialLevels.input),
+            "spatialLeadMs": Double(spatialLevels.output) * 1000,
+            "spatialOut": Double(spatialOutLevel),
             "opentrack": ["enabled": config.opentrackEnabled, "host": config.opentrackHost, "port": config.opentrackPort],
         ]
         let data = try! JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
@@ -1114,6 +1832,7 @@ final class Engine: NSObject, CMHeadphoneMotionManagerDelegate {
         }
         server.broadcast(event: "config", data: configJSON())
         modeDidChange(prompt: true)
+        if old.spatialAudio != config.spatialAudio { spatialDidChange() }
     }
 
     func resetConfig() {
@@ -1452,6 +2171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var modeItems: [String: NSMenuItem] = [:]
     var accessItem: NSMenuItem!
     var calibItem: NSMenuItem!
+    var spatialItem: NSMenuItem!
     let hud = CalibrationHUD()
 
     init(engine: Engine) {
@@ -1473,6 +2193,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(title)
         statusLine.isEnabled = false
         menu.addItem(statusLine)
+        menu.addItem(.separator())
+        spatialItem = item("Spatial Audio²", #selector(toggleSpatial), "", [])
+        menu.addItem(spatialItem)
         menu.addItem(.separator())
 
         for (mode, name) in [("off", "Off"), ("pov", "POV Mode"), ("cursor", "Cursor Mode")] {
@@ -1499,6 +2222,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         engine.onStatusText = { [weak self] text in self?.statusLine.title = text }
         engine.onModeChange = { [weak self] mode, allowed in self?.show(mode: mode, mouseAllowed: allowed) }
         engine.pointer.onClick = { NSSound(named: "Tink")?.play() }
+        engine.onSpatial = { [weak self] on, st in
+            self?.spatialItem.state = on ? .on : .off
+            self?.spatialItem.toolTip = st
+            self?.spatialItem.title = on && st != "on" && st != "off" ? "Spatial Audio² (\(st))" : "Spatial Audio²"
+        }
+        serverQ.async { [engine] in engine.spatialStateChanged(engine.spatialState) }
         engine.onCalib = { [weak self] ui in
             self?.hud.update(ui)
             self?.calibItem.title = ui.state == "running" ? "Cancel Calibration" : "Calibrate…"
@@ -1545,6 +2274,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func swap() { serverQ.async { self.engine.swapPovCursor() } }
     @objc func recenter() { serverQ.async { self.engine.recenter() } }
     @objc func calibrate() { serverQ.async { self.engine.calibrate("toggle") } }
+    @objc func toggleSpatial() { serverQ.async { self.engine.toggleSpatial() } }
     @objc func openPage() { NSWorkspace.shared.open(engine.opts.pageURL) }
 
     @objc func openAccessibility() {

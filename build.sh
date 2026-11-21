@@ -22,7 +22,7 @@ fi
 echo "Compiling Kopfkino…"
 swiftc -O -swift-version 5 \
   -target "$(uname -m)-apple-macos14.0" \
-  -framework CoreMotion -framework AppKit -framework Network -framework Carbon -framework AVFoundation \
+  -framework CoreMotion -framework AppKit -framework Network -framework Carbon -framework AVFoundation -framework AudioToolbox -framework CoreAudio \
   "$DIR/macos/Kopfkino.swift" \
   -o "$APP/Contents/MacOS/Kopfkino"
 
